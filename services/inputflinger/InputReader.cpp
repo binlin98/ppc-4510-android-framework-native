@@ -55,6 +55,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <cutils/properties.h>
 
 #define INDENT "  "
 #define INDENT2 "    "
@@ -3098,6 +3099,442 @@ bool TouchInputMapper::hasExternalStylus() const {
 }
 
 void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
+    char hwrotBuf[PROPERTY_VALUE_MAX];
+    int32_t hwrotation = DISPLAY_ORIENTATION_0;
+    if (property_get("ro.sf.hwrotation", hwrotBuf, NULL) > 0) {
+        switch (atoi(hwrotBuf)) {
+            case 90:
+                hwrotation = DISPLAY_ORIENTATION_90;
+                break;
+            case 180:
+                hwrotation = DISPLAY_ORIENTATION_180;
+                break;
+            case 270:
+                hwrotation = DISPLAY_ORIENTATION_270;
+                break;
+        }
+    }
+	
+    int32_t oldDeviceMode = mDeviceMode;
+
+    resolveExternalStylusPresence();
+
+    // Determine device mode.
+    if (mParameters.deviceType == Parameters::DEVICE_TYPE_POINTER
+            && mConfig.pointerGesturesEnabled) {
+        mSource = AINPUT_SOURCE_MOUSE;
+        mDeviceMode = DEVICE_MODE_POINTER;
+        if (hasStylus()) {
+            mSource |= AINPUT_SOURCE_STYLUS;
+        }
+    } else if (mParameters.deviceType == Parameters::DEVICE_TYPE_TOUCH_SCREEN
+            && mParameters.hasAssociatedDisplay) {
+        mSource = AINPUT_SOURCE_TOUCHSCREEN;
+        mDeviceMode = DEVICE_MODE_DIRECT;
+        if (hasStylus()) {
+            mSource |= AINPUT_SOURCE_STYLUS;
+        }
+        if (hasExternalStylus()) {
+            mSource |= AINPUT_SOURCE_BLUETOOTH_STYLUS;
+        }
+    } else if (mParameters.deviceType == Parameters::DEVICE_TYPE_TOUCH_NAVIGATION) {
+        mSource = AINPUT_SOURCE_TOUCH_NAVIGATION;
+        mDeviceMode = DEVICE_MODE_NAVIGATION;
+    } else {
+        mSource = AINPUT_SOURCE_TOUCHPAD;
+        mDeviceMode = DEVICE_MODE_UNSCALED;
+    }
+
+    // Ensure we have valid X and Y axes.
+    if (!mRawPointerAxes.x.valid || !mRawPointerAxes.y.valid) {
+        ALOGW(INDENT "Touch device '%s' did not report support for X or Y axis!  "
+                "The device will be inoperable.", getDeviceName().string());
+        mDeviceMode = DEVICE_MODE_DISABLED;
+        return;
+    }
+
+    // Raw width and height in the natural orientation.
+    int32_t rawWidth = mRawPointerAxes.x.maxValue - mRawPointerAxes.x.minValue + 1;
+    int32_t rawHeight = mRawPointerAxes.y.maxValue - mRawPointerAxes.y.minValue + 1;
+
+    // Get associated display dimensions.
+    DisplayViewport newViewport;
+    if (mParameters.hasAssociatedDisplay) {
+        if (!mConfig.getDisplayInfo(mParameters.associatedDisplayIsExternal, &newViewport)) {
+            ALOGI(INDENT "Touch device '%s' could not query the properties of its associated "
+                    "display.  The device will be inoperable until the display size "
+                    "becomes available.",
+                    getDeviceName().string());
+            mDeviceMode = DEVICE_MODE_DISABLED;
+            return;
+        }
+		newViewport.orientation = (newViewport.orientation + hwrotation) % 4;
+    } else {
+        if ((hwrotation == DISPLAY_ORIENTATION_90 ||
+                hwrotation == DISPLAY_ORIENTATION_270)) {
+            int tmp = rawWidth;
+            rawWidth = rawHeight;
+            rawHeight = tmp;
+        }
+        newViewport.setNonDisplayViewport(rawWidth, rawHeight);
+		newViewport.orientation = hwrotation;
+    }
+    bool viewportChanged = mViewport != newViewport;
+    if (viewportChanged) {
+        mViewport = newViewport;
+
+        if (mDeviceMode == DEVICE_MODE_DIRECT || mDeviceMode == DEVICE_MODE_POINTER) {
+            // Convert rotated viewport to natural surface coordinates.
+            int32_t naturalLogicalWidth, naturalLogicalHeight;
+            int32_t naturalPhysicalWidth, naturalPhysicalHeight;
+            int32_t naturalPhysicalLeft, naturalPhysicalTop;
+            int32_t naturalDeviceWidth, naturalDeviceHeight;
+            switch (mViewport.orientation) {
+            case DISPLAY_ORIENTATION_90:
+                naturalLogicalWidth = mViewport.logicalBottom - mViewport.logicalTop;
+                naturalLogicalHeight = mViewport.logicalRight - mViewport.logicalLeft;
+                naturalPhysicalWidth = mViewport.physicalBottom - mViewport.physicalTop;
+                naturalPhysicalHeight = mViewport.physicalRight - mViewport.physicalLeft;
+                naturalPhysicalLeft = mViewport.deviceHeight - mViewport.physicalBottom;
+                naturalPhysicalTop = mViewport.physicalLeft;
+                naturalDeviceWidth = mViewport.deviceHeight;
+                naturalDeviceHeight = mViewport.deviceWidth;
+                break;
+            case DISPLAY_ORIENTATION_180:
+                naturalLogicalWidth = mViewport.logicalRight - mViewport.logicalLeft;
+                naturalLogicalHeight = mViewport.logicalBottom - mViewport.logicalTop;
+                naturalPhysicalWidth = mViewport.physicalRight - mViewport.physicalLeft;
+                naturalPhysicalHeight = mViewport.physicalBottom - mViewport.physicalTop;
+                naturalPhysicalLeft = mViewport.deviceWidth - mViewport.physicalRight;
+                naturalPhysicalTop = mViewport.deviceHeight - mViewport.physicalBottom;
+                naturalDeviceWidth = mViewport.deviceWidth;
+                naturalDeviceHeight = mViewport.deviceHeight;
+                break;
+            case DISPLAY_ORIENTATION_270:
+                naturalLogicalWidth = mViewport.logicalBottom - mViewport.logicalTop;
+                naturalLogicalHeight = mViewport.logicalRight - mViewport.logicalLeft;
+                naturalPhysicalWidth = mViewport.physicalBottom - mViewport.physicalTop;
+                naturalPhysicalHeight = mViewport.physicalRight - mViewport.physicalLeft;
+                naturalPhysicalLeft = mViewport.physicalTop;
+                naturalPhysicalTop = mViewport.deviceWidth - mViewport.physicalRight;
+                naturalDeviceWidth = mViewport.deviceHeight;
+                naturalDeviceHeight = mViewport.deviceWidth;
+                break;
+            case DISPLAY_ORIENTATION_0:
+            default:
+                naturalLogicalWidth = mViewport.logicalRight - mViewport.logicalLeft;
+                naturalLogicalHeight = mViewport.logicalBottom - mViewport.logicalTop;
+                naturalPhysicalWidth = mViewport.physicalRight - mViewport.physicalLeft;
+                naturalPhysicalHeight = mViewport.physicalBottom - mViewport.physicalTop;
+                naturalPhysicalLeft = mViewport.physicalLeft;
+                naturalPhysicalTop = mViewport.physicalTop;
+                naturalDeviceWidth = mViewport.deviceWidth;
+                naturalDeviceHeight = mViewport.deviceHeight;
+                break;
+            }
+
+            mSurfaceWidth = naturalLogicalWidth * naturalDeviceWidth / naturalPhysicalWidth;
+            mSurfaceHeight = naturalLogicalHeight * naturalDeviceHeight / naturalPhysicalHeight;
+            mSurfaceLeft = naturalPhysicalLeft * naturalLogicalWidth / naturalPhysicalWidth;
+            mSurfaceTop = naturalPhysicalTop * naturalLogicalHeight / naturalPhysicalHeight;
+
+            mSurfaceOrientation = mParameters.orientationAware ?
+                    mViewport.orientation : DISPLAY_ORIENTATION_0;
+        } else {
+            mSurfaceWidth = rawWidth;
+            mSurfaceHeight = rawHeight;
+            mSurfaceLeft = 0;
+            mSurfaceTop = 0;
+            mSurfaceOrientation = DISPLAY_ORIENTATION_0;
+        }
+    }
+
+    // If moving between pointer modes, need to reset some state.
+    bool deviceModeChanged = mDeviceMode != oldDeviceMode;
+    if (deviceModeChanged) {
+        mOrientedRanges.clear();
+    }
+
+    // Create pointer controller if needed.
+    if (mDeviceMode == DEVICE_MODE_POINTER ||
+            (mDeviceMode == DEVICE_MODE_DIRECT && mConfig.showTouches)) {
+        if (mPointerController == NULL) {
+            mPointerController = getPolicy()->obtainPointerController(getDeviceId());
+        }
+    } else {
+        mPointerController.clear();
+    }
+
+    if (viewportChanged || deviceModeChanged) {
+        ALOGI("Device reconfigured: id=%d, name='%s', size %dx%d, orientation %d, mode %d, "
+                "display id %d",
+                getDeviceId(), getDeviceName().string(), mSurfaceWidth, mSurfaceHeight,
+                mSurfaceOrientation, mDeviceMode, mViewport.displayId);
+
+        // Configure X and Y factors.
+        mXScale = float(mSurfaceWidth) / rawWidth;
+        mYScale = float(mSurfaceHeight) / rawHeight;
+        mXTranslate = -mSurfaceLeft;
+        mYTranslate = -mSurfaceTop;
+        mXPrecision = 1.0f / mXScale;
+        mYPrecision = 1.0f / mYScale;
+
+        mOrientedRanges.x.axis = AMOTION_EVENT_AXIS_X;
+        mOrientedRanges.x.source = mSource;
+        mOrientedRanges.y.axis = AMOTION_EVENT_AXIS_Y;
+        mOrientedRanges.y.source = mSource;
+
+        configureVirtualKeys();
+
+        // Scale factor for terms that are not oriented in a particular axis.
+        // If the pixels are square then xScale == yScale otherwise we fake it
+        // by choosing an average.
+        mGeometricScale = avg(mXScale, mYScale);
+
+        // Size of diagonal axis.
+        float diagonalSize = hypotf(mSurfaceWidth, mSurfaceHeight);
+
+        // Size factors.
+        if (mCalibration.sizeCalibration != Calibration::SIZE_CALIBRATION_NONE) {
+            if (mRawPointerAxes.touchMajor.valid
+                    && mRawPointerAxes.touchMajor.maxValue != 0) {
+                mSizeScale = 1.0f / mRawPointerAxes.touchMajor.maxValue;
+            } else if (mRawPointerAxes.toolMajor.valid
+                    && mRawPointerAxes.toolMajor.maxValue != 0) {
+                mSizeScale = 1.0f / mRawPointerAxes.toolMajor.maxValue;
+            } else {
+                mSizeScale = 0.0f;
+            }
+
+            mOrientedRanges.haveTouchSize = true;
+            mOrientedRanges.haveToolSize = true;
+            mOrientedRanges.haveSize = true;
+
+            mOrientedRanges.touchMajor.axis = AMOTION_EVENT_AXIS_TOUCH_MAJOR;
+            mOrientedRanges.touchMajor.source = mSource;
+            mOrientedRanges.touchMajor.min = 0;
+            mOrientedRanges.touchMajor.max = diagonalSize;
+            mOrientedRanges.touchMajor.flat = 0;
+            mOrientedRanges.touchMajor.fuzz = 0;
+            mOrientedRanges.touchMajor.resolution = 0;
+
+            mOrientedRanges.touchMinor = mOrientedRanges.touchMajor;
+            mOrientedRanges.touchMinor.axis = AMOTION_EVENT_AXIS_TOUCH_MINOR;
+
+            mOrientedRanges.toolMajor.axis = AMOTION_EVENT_AXIS_TOOL_MAJOR;
+            mOrientedRanges.toolMajor.source = mSource;
+            mOrientedRanges.toolMajor.min = 0;
+            mOrientedRanges.toolMajor.max = diagonalSize;
+            mOrientedRanges.toolMajor.flat = 0;
+            mOrientedRanges.toolMajor.fuzz = 0;
+            mOrientedRanges.toolMajor.resolution = 0;
+
+            mOrientedRanges.toolMinor = mOrientedRanges.toolMajor;
+            mOrientedRanges.toolMinor.axis = AMOTION_EVENT_AXIS_TOOL_MINOR;
+
+            mOrientedRanges.size.axis = AMOTION_EVENT_AXIS_SIZE;
+            mOrientedRanges.size.source = mSource;
+            mOrientedRanges.size.min = 0;
+            mOrientedRanges.size.max = 1.0;
+            mOrientedRanges.size.flat = 0;
+            mOrientedRanges.size.fuzz = 0;
+            mOrientedRanges.size.resolution = 0;
+        } else {
+            mSizeScale = 0.0f;
+        }
+
+        // Pressure factors.
+        mPressureScale = 0;
+        if (mCalibration.pressureCalibration == Calibration::PRESSURE_CALIBRATION_PHYSICAL
+                || mCalibration.pressureCalibration
+                        == Calibration::PRESSURE_CALIBRATION_AMPLITUDE) {
+            if (mCalibration.havePressureScale) {
+                mPressureScale = mCalibration.pressureScale;
+            } else if (mRawPointerAxes.pressure.valid
+                    && mRawPointerAxes.pressure.maxValue != 0) {
+                mPressureScale = 1.0f / mRawPointerAxes.pressure.maxValue;
+            }
+        }
+
+        mOrientedRanges.pressure.axis = AMOTION_EVENT_AXIS_PRESSURE;
+        mOrientedRanges.pressure.source = mSource;
+        mOrientedRanges.pressure.min = 0;
+        mOrientedRanges.pressure.max = 1.0;
+        mOrientedRanges.pressure.flat = 0;
+        mOrientedRanges.pressure.fuzz = 0;
+        mOrientedRanges.pressure.resolution = 0;
+
+        // Tilt
+        mTiltXCenter = 0;
+        mTiltXScale = 0;
+        mTiltYCenter = 0;
+        mTiltYScale = 0;
+        mHaveTilt = mRawPointerAxes.tiltX.valid && mRawPointerAxes.tiltY.valid;
+        if (mHaveTilt) {
+            mTiltXCenter = avg(mRawPointerAxes.tiltX.minValue,
+                    mRawPointerAxes.tiltX.maxValue);
+            mTiltYCenter = avg(mRawPointerAxes.tiltY.minValue,
+                    mRawPointerAxes.tiltY.maxValue);
+            mTiltXScale = M_PI / 180;
+            mTiltYScale = M_PI / 180;
+
+            mOrientedRanges.haveTilt = true;
+
+            mOrientedRanges.tilt.axis = AMOTION_EVENT_AXIS_TILT;
+            mOrientedRanges.tilt.source = mSource;
+            mOrientedRanges.tilt.min = 0;
+            mOrientedRanges.tilt.max = M_PI_2;
+            mOrientedRanges.tilt.flat = 0;
+            mOrientedRanges.tilt.fuzz = 0;
+            mOrientedRanges.tilt.resolution = 0;
+        }
+
+        // Orientation
+        mOrientationScale = 0;
+        if (mHaveTilt) {
+            mOrientedRanges.haveOrientation = true;
+
+            mOrientedRanges.orientation.axis = AMOTION_EVENT_AXIS_ORIENTATION;
+            mOrientedRanges.orientation.source = mSource;
+            mOrientedRanges.orientation.min = -M_PI;
+            mOrientedRanges.orientation.max = M_PI;
+            mOrientedRanges.orientation.flat = 0;
+            mOrientedRanges.orientation.fuzz = 0;
+            mOrientedRanges.orientation.resolution = 0;
+        } else if (mCalibration.orientationCalibration !=
+                Calibration::ORIENTATION_CALIBRATION_NONE) {
+            if (mCalibration.orientationCalibration
+                    == Calibration::ORIENTATION_CALIBRATION_INTERPOLATED) {
+                if (mRawPointerAxes.orientation.valid) {
+                    if (mRawPointerAxes.orientation.maxValue > 0) {
+                        mOrientationScale = M_PI_2 / mRawPointerAxes.orientation.maxValue;
+                    } else if (mRawPointerAxes.orientation.minValue < 0) {
+                        mOrientationScale = -M_PI_2 / mRawPointerAxes.orientation.minValue;
+                    } else {
+                        mOrientationScale = 0;
+                    }
+                }
+            }
+
+            mOrientedRanges.haveOrientation = true;
+
+            mOrientedRanges.orientation.axis = AMOTION_EVENT_AXIS_ORIENTATION;
+            mOrientedRanges.orientation.source = mSource;
+            mOrientedRanges.orientation.min = -M_PI_2;
+            mOrientedRanges.orientation.max = M_PI_2;
+            mOrientedRanges.orientation.flat = 0;
+            mOrientedRanges.orientation.fuzz = 0;
+            mOrientedRanges.orientation.resolution = 0;
+        }
+
+        // Distance
+        mDistanceScale = 0;
+        if (mCalibration.distanceCalibration != Calibration::DISTANCE_CALIBRATION_NONE) {
+            if (mCalibration.distanceCalibration
+                    == Calibration::DISTANCE_CALIBRATION_SCALED) {
+                if (mCalibration.haveDistanceScale) {
+                    mDistanceScale = mCalibration.distanceScale;
+                } else {
+                    mDistanceScale = 1.0f;
+                }
+            }
+
+            mOrientedRanges.haveDistance = true;
+
+            mOrientedRanges.distance.axis = AMOTION_EVENT_AXIS_DISTANCE;
+            mOrientedRanges.distance.source = mSource;
+            mOrientedRanges.distance.min =
+                    mRawPointerAxes.distance.minValue * mDistanceScale;
+            mOrientedRanges.distance.max =
+                    mRawPointerAxes.distance.maxValue * mDistanceScale;
+            mOrientedRanges.distance.flat = 0;
+            mOrientedRanges.distance.fuzz =
+                    mRawPointerAxes.distance.fuzz * mDistanceScale;
+            mOrientedRanges.distance.resolution = 0;
+        }
+
+        // Compute oriented precision, scales and ranges.
+        // Note that the maximum value reported is an inclusive maximum value so it is one
+        // unit less than the total width or height of surface.
+        switch (mSurfaceOrientation) {
+        case DISPLAY_ORIENTATION_90:
+        case DISPLAY_ORIENTATION_270:
+            mOrientedXPrecision = mYPrecision;
+            mOrientedYPrecision = mXPrecision;
+
+            mOrientedRanges.x.min = mYTranslate;
+            mOrientedRanges.x.max = mSurfaceHeight + mYTranslate - 1;
+            mOrientedRanges.x.flat = 0;
+            mOrientedRanges.x.fuzz = 0;
+            mOrientedRanges.x.resolution = mRawPointerAxes.y.resolution * mYScale;
+
+            mOrientedRanges.y.min = mXTranslate;
+            mOrientedRanges.y.max = mSurfaceWidth + mXTranslate - 1;
+            mOrientedRanges.y.flat = 0;
+            mOrientedRanges.y.fuzz = 0;
+            mOrientedRanges.y.resolution = mRawPointerAxes.x.resolution * mXScale;
+            break;
+
+        default:
+            mOrientedXPrecision = mXPrecision;
+            mOrientedYPrecision = mYPrecision;
+
+            mOrientedRanges.x.min = mXTranslate;
+            mOrientedRanges.x.max = mSurfaceWidth + mXTranslate - 1;
+            mOrientedRanges.x.flat = 0;
+            mOrientedRanges.x.fuzz = 0;
+            mOrientedRanges.x.resolution = mRawPointerAxes.x.resolution * mXScale;
+
+            mOrientedRanges.y.min = mYTranslate;
+            mOrientedRanges.y.max = mSurfaceHeight + mYTranslate - 1;
+            mOrientedRanges.y.flat = 0;
+            mOrientedRanges.y.fuzz = 0;
+            mOrientedRanges.y.resolution = mRawPointerAxes.y.resolution * mYScale;
+            break;
+        }
+
+        // Location
+        updateAffineTransformation();
+
+        if (mDeviceMode == DEVICE_MODE_POINTER) {
+            // Compute pointer gesture detection parameters.
+            float rawDiagonal = hypotf(rawWidth, rawHeight);
+            float displayDiagonal = hypotf(mSurfaceWidth, mSurfaceHeight);
+
+            // Scale movements such that one whole swipe of the touch pad covers a
+            // given area relative to the diagonal size of the display when no acceleration
+            // is applied.
+            // Assume that the touch pad has a square aspect ratio such that movements in
+            // X and Y of the same number of raw units cover the same physical distance.
+            mPointerXMovementScale = mConfig.pointerGestureMovementSpeedRatio
+                    * displayDiagonal / rawDiagonal;
+            mPointerYMovementScale = mPointerXMovementScale;
+
+            // Scale zooms to cover a smaller range of the display than movements do.
+            // This value determines the area around the pointer that is affected by freeform
+            // pointer gestures.
+            mPointerXZoomScale = mConfig.pointerGestureZoomSpeedRatio
+                    * displayDiagonal / rawDiagonal;
+            mPointerYZoomScale = mPointerXZoomScale;
+
+            // Max width between pointers to detect a swipe gesture is more than some fraction
+            // of the diagonal axis of the touch pad.  Touches that are wider than this are
+            // translated into freeform gestures.
+            mPointerGestureMaxSwipeWidth =
+                    mConfig.pointerGestureSwipeMaxWidthRatio * rawDiagonal;
+
+            // Abort current pointer usages because the state has changed.
+            abortPointerUsage(when, 0 /*policyFlags*/);
+        }
+
+        // Inform the dispatcher about the changes.
+        *outResetNeeded = true;
+        bumpGeneration();
+    }
+}
+
+#if 0
+void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
     int32_t oldDeviceMode = mDeviceMode;
 
     resolveExternalStylusPresence();
@@ -3507,6 +3944,7 @@ void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
         bumpGeneration();
     }
 }
+#endif
 
 void TouchInputMapper::dumpSurface(String8& dump) {
     dump.appendFormat(INDENT3 "Viewport: displayId=%d, orientation=%d, "
